@@ -1,4 +1,4 @@
-# YouTube Video Chat
+# Talking Youtube
 
 An AI-powered chat system that allows users to interact with YouTube video content through natural language queries. Built using LangChain and Google's Gemini model.
 
@@ -92,9 +92,6 @@ print(answer)
 4. Push to the branch
 5. Open a Pull Request
 
-## License
-
-[Add your chosen license]
 
 ## Acknowledgments
 
