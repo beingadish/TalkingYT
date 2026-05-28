@@ -173,3 +173,12 @@ poetry.toml
 
 # LSP config files
 pyrightconfig.json
+
+### Local runtime ###
+.DS_Store
+node_modules/
+.next/
+*.tsbuildinfo
+out/
+data/
+.waylog/

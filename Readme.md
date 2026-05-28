@@ -1,101 +1,95 @@
-# Talking Youtube
+# Talking YouTube
 
-An AI-powered chat system that allows users to interact with YouTube video content through natural language queries. Built using LangChain and Google's Gemini model.
+Chat with one or more YouTube videos by indexing their transcripts into a FAISS vector store, then asking transcript-grounded questions through a FastAPI backend and a minimal Next.js frontend.
 
-## Features
+## What is implemented
 
-- Extract transcripts from YouTube videos
-- Process and chunk video transcripts
-- Generate embeddings using Google's Gemini model
-- Create semantic search capabilities using FAISS vector store
-- Interactive Q&A with video content
-- Multi-query retrieval for better context understanding
+- Single or multi-video transcript ingestion
+- YouTube URL and raw video id parsing
+- Transcript chunking with timestamp labels
+- Gemini embeddings with FAISS similarity retrieval
+- Gemini chat responses constrained to retrieved transcript context
+- Optional RAGAS answer relevancy scoring
+- FastAPI endpoints for health, sessions, and chat
+- Next.js frontend with a black/white monospace console UI
 
-## Prerequisites
+## Project layout
 
-- Python 3.8+
-- Google API Key (for Gemini model)
-- Virtual Environment (recommended)
-
-## Installation
-
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd TalkingYoutube
-```
-
-2. Create and activate a virtual environment:
-```bash
-python -m venv venv
-# On Windows
-.\venv\Scripts\activate
-# On Unix or MacOS
-source venv/bin/activate
-```
-
-3. Install required packages:
-```bash
-pip install -r requirements.txt
-```
-
-4. Create a `.env` file in the root directory and add your Google API key:
-```
-GOOGLE_API_KEY=your_api_key_here
-```
-
-## Project Structure
-
-```
+```text
 TalkingYoutube/
-├── assistant/
-│   └── prompt.py           # AI assistant prompt templates
-├── indexing/
-│   ├── document_load.py    # YouTube transcript fetching
-│   ├── embedder.py         # Document embedding generation
-│   └── splitter.py         # Text splitting utilities
-├── utils/
-│   ├── formatter.py        # Context formatting
-│   └── parser.py          # Output parsing
-├── .env                    # Environment variables
-├── main.py                # Main application
-└── requirements.txt       # Project dependencies
+├── backend/
+│   ├── app.py           # FastAPI routes
+│   ├── config.py        # Environment settings
+│   ├── evaluation.py    # RAGAS answer relevancy integration
+│   ├── models.py        # API schemas
+│   ├── rag.py           # Indexing, retrieval, generation
+│   └── transcripts.py   # YouTube transcript fetching
+├── frontend/
+│   └── app/             # Next.js App Router UI
+├── indexing/            # Earlier prototype helpers
+├── assistant/           # Earlier prototype prompt helper
+├── utils/               # Earlier prototype utilities
+├── main.py              # FastAPI entry point
+└── requirements.txt
 ```
 
-## Usage
+## Backend setup
 
-1. Run the main script with a YouTube video ID:
 ```bash
-python main.py
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-2. The system will:
-   - Fetch the video transcript
-   - Split it into manageable chunks
-   - Generate embeddings
-   - Create a vector store
-   - Allow you to ask questions about the video content
+Set `GOOGLE_API_KEY` in `.env`, then start the API:
 
-## Example
-
-```python
-question = "What is vectorization?"
-answer = ask.invoke(question)
-print(answer)
+```bash
+uvicorn main:app --reload --port 8000
 ```
 
-## Contributing
+Health check:
 
-1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Open a Pull Request
+```bash
+curl http://localhost:8000/api/health
+```
 
+## Frontend setup
 
-## Acknowledgments
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-- LangChain for the framework
-- Google's Gemini model for embeddings and chat
-- FAISS for vector storage
-- YouTube Transcript API for caption extraction
+Open `http://localhost:3000`.
+
+If the API is not on `http://localhost:8000`, set:
+
+```bash
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+## API
+
+Create an indexed session:
+
+```bash
+curl -X POST http://localhost:8000/api/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"videos":["https://www.youtube.com/watch?v=VIDEO_ID"],"languages":["en"]}'
+```
+
+Ask a question:
+
+```bash
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"SESSION_ID","message":"What is the core idea?","top_k":5,"evaluate":true}'
+```
+
+## Notes
+
+- Sessions are currently in memory. Restarting the API clears indexed videos.
+- RAGAS scoring is optional per request because it makes extra LLM and embedding calls.
+- If RAGAS or `google-genai` is not installed, the answer still returns and the evaluation field reports `unavailable`.
