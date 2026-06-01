@@ -6,6 +6,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Patch OS packages to pick up the latest security fixes.
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
