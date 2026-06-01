@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from pgvector import Vector
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
@@ -212,7 +213,7 @@ class Repository:
                     "1 - (embedding <=> %s) AS score "
                     "FROM chunks WHERE session_id = %s "
                     "ORDER BY embedding <=> %s ASC LIMIT %s",
-                    (query_embedding, session_id, query_embedding, top_k),
+                    (Vector(query_embedding), session_id, Vector(query_embedding), top_k),
                 )
                 rows = await cur.fetchall()
         return [
