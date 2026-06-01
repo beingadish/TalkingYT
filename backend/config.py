@@ -17,14 +17,25 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+# Values shipped in .env.example that must never be treated as a real key.
+_PLACEHOLDER_API_KEYS = {"", "your_google_api_key"}
+
+
+def _api_key_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value in _PLACEHOLDER_API_KEYS:
+        return ""
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
-    google_api_key: str = field(default_factory=lambda: os.getenv("GOOGLE_API_KEY", ""))
+    google_api_key: str = field(default_factory=lambda: _api_key_env("GOOGLE_API_KEY"))
     google_chat_model: str = field(
         default_factory=lambda: os.getenv("GOOGLE_CHAT_MODEL", "gemini-2.5-flash")
     )
     google_eval_model: str = field(
-        default_factory=lambda: os.getenv("GOOGLE_EVAL_MODEL", "gemini-2.0-flash")
+        default_factory=lambda: os.getenv("GOOGLE_EVAL_MODEL", "gemini-2.5-flash")
     )
     google_embedding_model: str = field(
         default_factory=lambda: os.getenv(

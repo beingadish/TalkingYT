@@ -52,16 +52,22 @@ class RagasEvaluator:
         payload: EvaluationPayload,
     ) -> RagasEvaluation:
         _ensure_ragas_langchain_community_vertexai()
+        import instructor
         from google import genai
         from ragas.embeddings import GoogleEmbeddings
-        from ragas.llms import llm_factory
+        from ragas.llms.base import InstructorLLM, InstructorModelArgs
         from ragas.metrics.collections import AnswerRelevancy
 
         client = genai.Client(api_key=self.settings.google_api_key)
-        llm = llm_factory(
-            self.settings.google_eval_model,
+        # ragas' llm_factory wraps google clients synchronously, but the
+        # collections metrics call agenerate(), so build an async-capable
+        # instructor client explicitly.
+        async_client = instructor.from_genai(client, use_async=True)
+        llm = InstructorLLM(
+            client=async_client,
+            model=self.settings.google_eval_model,
             provider="google",
-            client=client,
+            model_args=InstructorModelArgs(),
         )
         embeddings = GoogleEmbeddings(
             client=client,

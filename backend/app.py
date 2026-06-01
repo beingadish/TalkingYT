@@ -11,7 +11,7 @@ from backend.models import (
     SessionSummary,
     VideoInput,
 )
-from backend.rag import MissingConfigurationError, RagEngine
+from backend.rag import MissingConfigurationError, ProviderError, RagEngine
 from backend.transcripts import TranscriptError
 
 
@@ -58,6 +58,8 @@ async def create_session(payload: VideoInput) -> IndexResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except TranscriptError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/sessions", response_model=list[SessionSummary])
@@ -94,4 +96,6 @@ async def chat(payload: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 

@@ -4,13 +4,19 @@ import {
   Activity,
   Bot,
   CircleAlert,
+  ExternalLink,
   LoaderCircle,
+  Pause,
   Play,
   Send,
+  Square,
   Trash2,
+  Volume2,
   Youtube
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type VideoSummary = {
   video_id: string;
@@ -106,6 +112,111 @@ function scoreLabel(evaluation: RagasEvaluation) {
   return `${Math.round(evaluation.score * 100)}%`;
 }
 
+// Strip inline [hh:mm:ss] markers and collapse whitespace so transcript
+// snippets read as prose instead of a timestamped dump.
+function cleanSnippet(text: string) {
+  return text
+    .replace(/\[\d{1,2}:\d{2}(?::\d{2})?\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Flatten markdown into a plain sentence stream for the speech synthesizer.
+function markdownToSpeech(markdown: string) {
+  return markdown
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(\*|_)(.*?)\1/g, "$2")
+    .replace(/^\s*>\s?/gm, "")
+    .replace(/^\s*[-*+]\s+/gm, ". ")
+    .replace(/^\s*\d+\.\s+/gm, ". ")
+    .replace(/\n{2,}/g, ". ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+type SpeechController = {
+  supported: boolean;
+  speakingId: string | null;
+  paused: boolean;
+  toggle: (id: string, text: string) => void;
+  stop: () => void;
+};
+
+function useSpeech(): SpeechController {
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [supported, setSupported] = useState(false);
+
+  useEffect(() => {
+    setSupported(typeof window !== "undefined" && "speechSynthesis" in window);
+  }, []);
+
+  const stop = useCallback(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return;
+    }
+    window.speechSynthesis.cancel();
+    setSpeakingId(null);
+    setPaused(false);
+  }, []);
+
+  const toggle = useCallback(
+    (id: string, text: string) => {
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+        return;
+      }
+      const synth = window.speechSynthesis;
+
+      if (speakingId === id) {
+        if (paused) {
+          synth.resume();
+          setPaused(false);
+        } else {
+          synth.pause();
+          setPaused(true);
+        }
+        return;
+      }
+
+      synth.cancel();
+      const spoken = text.trim();
+      if (!spoken) {
+        return;
+      }
+      const utterance = new SpeechSynthesisUtterance(spoken);
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      utterance.onend = () => {
+        setSpeakingId((current) => (current === id ? null : current));
+        setPaused(false);
+      };
+      utterance.onerror = () => {
+        setSpeakingId((current) => (current === id ? null : current));
+        setPaused(false);
+      };
+      synth.speak(utterance);
+      setSpeakingId(id);
+      setPaused(false);
+    },
+    [paused, speakingId]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
+  return { supported, speakingId, paused, toggle, stop };
+}
+
 export function TalkingYoutubeConsole() {
   const [videoInput, setVideoInput] = useState("");
   const [question, setQuestion] = useState("");
@@ -127,6 +238,7 @@ export function TalkingYoutubeConsole() {
   const videos = useMemo(() => splitVideoInput(videoInput), [videoInput]);
   const busy = isIndexing || isAsking;
   const statusVerb = isIndexing ? "braiding" : isAsking ? "ruminating" : "listening";
+  const speech = useSpeech();
 
   useEffect(() => {
     let ignore = false;
@@ -254,6 +366,7 @@ export function TalkingYoutubeConsole() {
   }
 
   async function clearSession() {
+    speech.stop();
     if (session) {
       await fetch(`${API_URL}/api/sessions/${session.session_id}`, { method: "DELETE" }).catch(
         () => undefined
@@ -405,7 +518,7 @@ export function TalkingYoutubeConsole() {
 
           <div className="messages" aria-live="polite">
             {messages.map((message) => (
-              <MessageBubble key={message.id} message={message} />
+              <MessageBubble key={message.id} message={message} speech={speech} />
             ))}
 
             {isAsking && (
@@ -442,7 +555,13 @@ export function TalkingYoutubeConsole() {
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({
+  message,
+  speech
+}: {
+  message: Message;
+  speech: SpeechController;
+}) {
   if (message.role === "system") {
     return <div className="system-line">{message.content}</div>;
   }
@@ -456,30 +575,76 @@ function MessageBubble({ message }: { message: Message }) {
     );
   }
 
+  const isSpeaking = speech.speakingId === message.id;
+  const isPaused = isSpeaking && speech.paused;
+
   return (
     <article className="message assistant">
       <div className="message-meta">
         <span>assistant</span>
-        <span>{scoreLabel(message.evaluation)}</span>
+        <div className="meta-actions">
+          <span>{scoreLabel(message.evaluation)}</span>
+          {speech.supported && (
+            <div className="tts-controls" role="group" aria-label="Read answer aloud">
+              <button
+                type="button"
+                className={isSpeaking && !isPaused ? "tts-button active" : "tts-button"}
+                onClick={() =>
+                  speech.toggle(message.id, markdownToSpeech(message.content))
+                }
+                aria-label={
+                  isSpeaking ? (isPaused ? "Resume reading" : "Pause reading") : "Read answer aloud"
+                }
+                title={
+                  isSpeaking ? (isPaused ? "resume" : "pause") : "speak"
+                }
+              >
+                {isSpeaking && !isPaused ? <Pause size={14} /> : <Volume2 size={14} />}
+              </button>
+              {isSpeaking && (
+                <button
+                  type="button"
+                  className="tts-button"
+                  onClick={speech.stop}
+                  aria-label="Stop reading"
+                  title="stop"
+                >
+                  <Square size={14} />
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       </div>
-      <p className="answer-text">{message.content}</p>
-      <div className="source-list">
-        {message.sources.map((source, index) => (
-          <a
-            href={source.source_url}
-            target="_blank"
-            rel="noreferrer"
-            className="source"
-            key={`${source.video_id}-${index}`}
-          >
-            <span>
-              {source.video_id}
-              {source.timestamp ? ` @ ${source.timestamp}` : ""}
-            </span>
-            <small>{source.text}</small>
-          </a>
-        ))}
+
+      <div className="answer-text markdown">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
       </div>
+
+      {message.sources.length > 0 && (
+        <div className="source-list">
+          <p className="source-heading">sources · {message.sources.length}</p>
+          {message.sources.map((source, index) => (
+            <a
+              href={source.source_url}
+              target="_blank"
+              rel="noreferrer"
+              className="source"
+              key={`${source.video_id}-${index}`}
+            >
+              <span className="source-head">
+                <span className="source-index">{index + 1}</span>
+                <span className="source-id">{source.video_id}</span>
+                {source.timestamp && (
+                  <span className="source-time">@ {source.timestamp}</span>
+                )}
+                <ExternalLink size={13} aria-hidden="true" className="source-link-icon" />
+              </span>
+              <small>{cleanSnippet(source.text)}</small>
+            </a>
+          ))}
+        </div>
+      )}
       {message.evaluation.reason && (
         <p className="eval-note">{message.evaluation.reason}</p>
       )}

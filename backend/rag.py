@@ -38,6 +38,10 @@ class MissingConfigurationError(RuntimeError):
     """Raised when the configured model provider cannot be used."""
 
 
+class ProviderError(RuntimeError):
+    """Raised when the upstream model provider (Gemini) rejects a request."""
+
+
 @dataclass
 class VideoSession:
     session_id: str
@@ -99,9 +103,8 @@ class RagEngine:
             raise TranscriptError("No transcript chunks were created.")
 
         vector_store = await asyncio.to_thread(
-            FAISS.from_documents,
+            self._build_vector_store,
             docs,
-            self._get_embeddings(),
         )
         session_id = uuid4().hex[:12]
         session = VideoSession(
@@ -134,7 +137,8 @@ class RagEngine:
 
         retrieval_count = top_k or self.settings.default_top_k
         matches = await asyncio.to_thread(
-            session.vector_store.similarity_search_with_score,
+            self._similarity_search,
+            session,
             question,
             retrieval_count,
         )
@@ -208,6 +212,26 @@ class RagEngine:
         if not self.settings.google_api_key:
             raise MissingConfigurationError("GOOGLE_API_KEY is not configured.")
 
+    def _build_vector_store(self, docs: list[Document]) -> FAISS:
+        try:
+            return FAISS.from_documents(docs, self._get_embeddings())
+        except Exception as exc:
+            raise _as_provider_error(exc) from exc
+
+    def _similarity_search(
+        self,
+        session: VideoSession,
+        question: str,
+        retrieval_count: int,
+    ) -> list[tuple[Document, float]]:
+        try:
+            return session.vector_store.similarity_search_with_score(
+                question,
+                retrieval_count,
+            )
+        except Exception as exc:
+            raise _as_provider_error(exc) from exc
+
     def _get_embeddings(self) -> GoogleGenerativeAIEmbeddings:
         if self._embeddings is None:
             self._embeddings = GoogleGenerativeAIEmbeddings(
@@ -231,6 +255,8 @@ class RagEngine:
             result = await llm.ainvoke(prompt)
         except AttributeError:
             result = await asyncio.to_thread(llm.invoke, prompt)
+        except Exception as exc:
+            raise _as_provider_error(exc) from exc
         content = getattr(result, "content", result)
         return str(content).strip()
 
@@ -240,8 +266,27 @@ class RagEngine:
         return RagasEvaluation(status="skipped", reason="Evaluation was disabled.")
 
 
-def _build_prompt(question: str, context: str) -> str:
-    return f"""
+def _as_provider_error(exc: Exception) -> Exception:
+    """Translate upstream Gemini/provider failures into a clean ProviderError.
+
+    Auth/invalid-key failures are the most common cause, so they are given a
+    clear, actionable message. Already-handled domain errors pass through.
+    """
+    if isinstance(exc, (MissingConfigurationError, ProviderError, TranscriptError)):
+        return exc
+    message = str(exc)
+    lowered = message.lower()
+    if "api key not valid" in lowered or "api_key_invalid" in lowered:
+        return ProviderError(
+            "Google rejected the request: the GOOGLE_API_KEY is invalid. "
+            "Set a valid key in .env and restart the server."
+        )
+    if "permission" in lowered or "unauthenticated" in lowered or "401" in lowered:
+        return ProviderError(f"Google authentication failed: {message}")
+    return ProviderError(f"Gemini request failed: {message}")
+
+
+def _build_prompt(question: str, context: str) -> str:    return f"""
 You are Talking YouTube, a precise transcript-grounded assistant.
 
 Rules:
