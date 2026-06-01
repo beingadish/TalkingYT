@@ -65,7 +65,11 @@ class RagEngine:
         self._ensure_google_key()
         session_id = uuid4().hex[:12]
         await self.repository.create_session(session_id, title)
-        indexed, total_chunks = await self._index_videos(session_id, videos, languages)
+        try:
+            indexed, total_chunks = await self._index_videos(session_id, videos, languages)
+        except BaseException:
+            await self.repository.delete_session(session_id)
+            raise
         summary = await self.repository.get_session_summary(session_id)
         return IndexResponse(
             **_summary_payload(summary),
