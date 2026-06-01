@@ -56,6 +56,29 @@ class ChatRequest(BaseModel):
     evaluate: bool = True
 
 
+class AddVideosRequest(BaseModel):
+    videos: list[str] = Field(..., min_length=1, max_length=12)
+    languages: list[str] = Field(default_factory=lambda: ["en"])
+
+    @field_validator("videos")
+    @classmethod
+    def clean_videos(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            stripped = item.strip()
+            if stripped and stripped not in cleaned:
+                cleaned.append(stripped)
+        if not cleaned:
+            raise ValueError("At least one YouTube URL or video id is required.")
+        return cleaned
+
+    @field_validator("languages")
+    @classmethod
+    def clean_languages(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value if item.strip()]
+        return cleaned or ["en"]
+
+
 class SourceChunk(BaseModel):
     video_id: str
     source_url: str
@@ -76,6 +99,14 @@ class ChatResponse(BaseModel):
     answer: str
     sources: list[SourceChunk]
     evaluation: RagasEvaluation
+
+
+class MessageItem(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+    sources: list[SourceChunk] = Field(default_factory=list)
+    evaluation: RagasEvaluation | None = None
+    created_at: datetime
 
 
 class HealthResponse(BaseModel):

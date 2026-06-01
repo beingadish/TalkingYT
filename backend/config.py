@@ -50,6 +50,10 @@ class Settings:
         default_factory=lambda: _int_env("TRANSCRIPT_CHUNK_OVERLAP", 180)
     )
     default_top_k: int = field(default_factory=lambda: _int_env("DEFAULT_TOP_K", 5))
+    database_url: str = field(
+        default_factory=lambda: os.getenv("DATABASE_URL", "").strip()
+    )
+    embedding_dim: int = field(default_factory=lambda: _int_env("EMBEDDING_DIM", 3072))
     cors_origins: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:

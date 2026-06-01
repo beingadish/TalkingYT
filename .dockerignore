@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Node / frontend build artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+
+# Env / secrets (provided at runtime via compose env_file)
+.env
+
+# VCS / editors / OS
+.git/
+.gitignore
+.idea/
+.vscode/
+.waylog/
+.DS_Store
+
+# Earlier standalone prototypes (not used by the backend)
+indexing/
+assistant/
+utils/

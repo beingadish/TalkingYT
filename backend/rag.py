@@ -1,18 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import re
 from uuid import uuid4
 
 from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-
-try:
-    from langchain_community.vectorstores import FAISS
-except ImportError:  # pragma: no cover - compatibility with older LangChain installs.
-    from langchain.vectorstores import FAISS
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -24,11 +17,24 @@ from backend.evaluation import EvaluationPayload, RagasEvaluator
 from backend.models import (
     ChatResponse,
     IndexResponse,
+    MessageItem,
+    RagasEvaluation,
     SessionSummary,
     SourceChunk,
     VideoSummary,
 )
-from backend.transcripts import TranscriptBundle, TranscriptError, fetch_transcript, source_url
+from backend.repository import (
+    ChunkRecord,
+    Repository,
+    SessionNotFoundError,
+    VideoNotFoundError,
+)
+from backend.transcripts import (
+    TranscriptBundle,
+    TranscriptError,
+    fetch_transcript,
+    source_url,
+)
 
 
 TIMESTAMP_RE = re.compile(r"\[(?P<timestamp>\d{2}:\d{2}(?::\d{2})?)\]")
@@ -42,31 +48,10 @@ class ProviderError(RuntimeError):
     """Raised when the upstream model provider (Gemini) rejects a request."""
 
 
-@dataclass
-class VideoSession:
-    session_id: str
-    created_at: datetime
-    title: str | None
-    videos: list[VideoSummary]
-    vector_store: FAISS
-    total_chunks: int
-    total_transcript_characters: int
-
-    def summary(self) -> SessionSummary:
-        return SessionSummary(
-            session_id=self.session_id,
-            title=self.title,
-            created_at=self.created_at,
-            videos=self.videos,
-            total_chunks=self.total_chunks,
-            total_transcript_characters=self.total_transcript_characters,
-        )
-
-
 class RagEngine:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, repository: Repository):
         self.settings = settings
-        self.sessions: dict[str, VideoSession] = {}
+        self.repository = repository
         self._embeddings: GoogleGenerativeAIEmbeddings | None = None
         self._llm: ChatGoogleGenerativeAI | None = None
         self._evaluator = RagasEvaluator(settings)
@@ -78,50 +63,84 @@ class RagEngine:
         title: str | None = None,
     ) -> IndexResponse:
         self._ensure_google_key()
+        session_id = uuid4().hex[:12]
+        await self.repository.create_session(session_id, title)
+        indexed, total_chunks = await self._index_videos(session_id, videos, languages)
+        summary = await self.repository.get_session_summary(session_id)
+        return IndexResponse(
+            **_summary_payload(summary),
+            status="indexed",
+            message=f"Indexed {indexed} video(s) into {total_chunks} transcript chunks.",
+        )
+
+    async def add_videos(
+        self,
+        session_id: str,
+        videos: list[str],
+        languages: list[str],
+    ) -> IndexResponse:
+        self._ensure_google_key()
+        if not await self.repository.session_exists(session_id):
+            raise SessionNotFoundError(f"Session {session_id} was not found.")
+        indexed, total_chunks = await self._index_videos(session_id, videos, languages)
+        summary = await self.repository.get_session_summary(session_id)
+        return IndexResponse(
+            **_summary_payload(summary),
+            status="indexed",
+            message=f"Added {indexed} video(s) as {total_chunks} new transcript chunks.",
+        )
+
+    async def _index_videos(
+        self,
+        session_id: str,
+        videos: list[str],
+        languages: list[str],
+    ) -> tuple[int, int]:
         bundles = await asyncio.gather(
             *(asyncio.to_thread(fetch_transcript, video, languages) for video in videos)
         )
 
-        docs: list[Document] = []
-        summaries: list[VideoSummary] = []
-        total_chars = 0
+        indexed = 0
+        new_chunks = 0
         for bundle in bundles:
-            video_docs = self._documents_from_transcript(bundle)
-            docs.extend(video_docs)
-            transcript_characters = len(bundle.transcript_text)
-            total_chars += transcript_characters
-            summaries.append(
-                VideoSummary(
-                    video_id=bundle.video_id,
-                    source_url=bundle.source_url,
-                    transcript_characters=transcript_characters,
-                    snippet_count=len(bundle.snippets),
-                )
+            documents = self._documents_from_transcript(bundle)
+            if not documents:
+                continue
+            vectors = await asyncio.to_thread(
+                self._embed_documents,
+                [doc.page_content for doc in documents],
             )
+            chunk_rows = [
+                {
+                    "chunk_index": doc.metadata["chunk_index"],
+                    "content": doc.page_content,
+                    "timestamp": doc.metadata.get("timestamp"),
+                    "source_url": doc.metadata.get("source_url"),
+                    "embedding": vector,
+                }
+                for doc, vector in zip(documents, vectors)
+            ]
+            await self.repository.add_video(
+                session_id=session_id,
+                video_id=bundle.video_id,
+                source_url=bundle.source_url,
+                transcript_characters=len(bundle.transcript_text),
+                snippet_count=len(bundle.snippets),
+            )
+            await self.repository.add_chunks(session_id, bundle.video_id, chunk_rows)
+            indexed += 1
+            new_chunks += len(chunk_rows)
 
-        if not docs:
+        if indexed == 0:
             raise TranscriptError("No transcript chunks were created.")
+        return indexed, new_chunks
 
-        vector_store = await asyncio.to_thread(
-            self._build_vector_store,
-            docs,
-        )
-        session_id = uuid4().hex[:12]
-        session = VideoSession(
-            session_id=session_id,
-            created_at=datetime.now(timezone.utc),
-            title=title,
-            videos=summaries,
-            vector_store=vector_store,
-            total_chunks=len(docs),
-            total_transcript_characters=total_chars,
-        )
-        self.sessions[session_id] = session
-        return IndexResponse(
-            **session.summary().model_dump(),
-            status="indexed",
-            message=f"Indexed {len(summaries)} video(s) into {len(docs)} transcript chunks.",
-        )
+    async def remove_video(self, session_id: str, video_id: str) -> SessionSummary:
+        if not await self.repository.session_exists(session_id):
+            raise SessionNotFoundError(f"Session {session_id} was not found.")
+        await self.repository.remove_video(session_id, video_id)
+        summary = await self.repository.get_session_summary(session_id)
+        return SessionSummary(**_summary_payload(summary))
 
     async def chat(
         self,
@@ -131,33 +150,38 @@ class RagEngine:
         evaluate: bool = True,
     ) -> ChatResponse:
         self._ensure_google_key()
-        session = self.sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"Session {session_id} was not found.")
+        if not await self.repository.session_exists(session_id):
+            raise SessionNotFoundError(f"Session {session_id} was not found.")
 
         retrieval_count = top_k or self.settings.default_top_k
-        matches = await asyncio.to_thread(
-            self._similarity_search,
-            session,
-            question,
-            retrieval_count,
+        query_vector = await asyncio.to_thread(self._embed_query, question)
+        matches = await self.repository.similarity_search(
+            session_id, query_vector, retrieval_count
         )
-        documents = [doc for doc, _score in matches]
-        context = _format_context(documents)
+        context = _format_context(matches)
         prompt = _build_prompt(question=question, context=context)
 
         response = await self._invoke_llm(prompt)
-        sources = [_source_from_match(doc, score) for doc, score in matches]
+        sources = [_source_from_match(match) for match in matches]
         evaluation = (
             await self._evaluator.answer_relevancy(
                 EvaluationPayload(
                     question=question,
                     answer=response,
-                    contexts=[doc.page_content for doc in documents],
+                    contexts=[match.content for match in matches],
                 )
             )
             if evaluate
-            else await self._skipped_evaluation()
+            else RagasEvaluation(status="skipped", reason="Evaluation was disabled.")
+        )
+
+        await self.repository.add_message(session_id, "user", question)
+        await self.repository.add_message(
+            session_id,
+            "assistant",
+            response,
+            sources=[src.model_dump() for src in sources],
+            evaluation=evaluation.model_dump(),
         )
 
         return ChatResponse(
@@ -167,18 +191,33 @@ class RagEngine:
             evaluation=evaluation,
         )
 
-    def list_sessions(self) -> list[SessionSummary]:
-        return [session.summary() for session in self.sessions.values()]
+    async def list_sessions(self) -> list[SessionSummary]:
+        summaries = await self.repository.list_session_summaries()
+        return [SessionSummary(**_summary_payload(item)) for item in summaries]
 
-    def get_session(self, session_id: str) -> SessionSummary:
-        session = self.sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"Session {session_id} was not found.")
-        return session.summary()
+    async def get_session(self, session_id: str) -> SessionSummary:
+        summary = await self.repository.get_session_summary(session_id)
+        return SessionSummary(**_summary_payload(summary))
 
-    def delete_session(self, session_id: str) -> None:
-        if self.sessions.pop(session_id, None) is None:
-            raise KeyError(f"Session {session_id} was not found.")
+    async def delete_session(self, session_id: str) -> None:
+        await self.repository.delete_session(session_id)
+
+    async def get_messages(self, session_id: str) -> list[MessageItem]:
+        if not await self.repository.session_exists(session_id):
+            raise SessionNotFoundError(f"Session {session_id} was not found.")
+        rows = await self.repository.get_messages(session_id)
+        return [
+            MessageItem(
+                role=row["role"],
+                content=row["content"],
+                sources=[SourceChunk(**src) for src in (row["sources"] or [])],
+                evaluation=(
+                    RagasEvaluation(**row["evaluation"]) if row["evaluation"] else None
+                ),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
     def _documents_from_transcript(self, bundle: TranscriptBundle) -> list[Document]:
         timed_transcript = "\n".join(
@@ -212,23 +251,15 @@ class RagEngine:
         if not self.settings.google_api_key:
             raise MissingConfigurationError("GOOGLE_API_KEY is not configured.")
 
-    def _build_vector_store(self, docs: list[Document]) -> FAISS:
+    def _embed_documents(self, texts: list[str]) -> list[list[float]]:
         try:
-            return FAISS.from_documents(docs, self._get_embeddings())
+            return self._get_embeddings().embed_documents(texts)
         except Exception as exc:
             raise _as_provider_error(exc) from exc
 
-    def _similarity_search(
-        self,
-        session: VideoSession,
-        question: str,
-        retrieval_count: int,
-    ) -> list[tuple[Document, float]]:
+    def _embed_query(self, text: str) -> list[float]:
         try:
-            return session.vector_store.similarity_search_with_score(
-                question,
-                retrieval_count,
-            )
+            return self._get_embeddings().embed_query(text)
         except Exception as exc:
             raise _as_provider_error(exc) from exc
 
@@ -260,10 +291,16 @@ class RagEngine:
         content = getattr(result, "content", result)
         return str(content).strip()
 
-    async def _skipped_evaluation(self):
-        from backend.models import RagasEvaluation
 
-        return RagasEvaluation(status="skipped", reason="Evaluation was disabled.")
+def _summary_payload(summary: dict) -> dict:
+    return {
+        "session_id": summary["session_id"],
+        "title": summary["title"],
+        "created_at": summary["created_at"],
+        "videos": [VideoSummary(**video) for video in summary["videos"]],
+        "total_chunks": summary["total_chunks"],
+        "total_transcript_characters": summary["total_transcript_characters"],
+    }
 
 
 def _as_provider_error(exc: Exception) -> Exception:
@@ -286,7 +323,8 @@ def _as_provider_error(exc: Exception) -> Exception:
     return ProviderError(f"Gemini request failed: {message}")
 
 
-def _build_prompt(question: str, context: str) -> str:    return f"""
+def _build_prompt(question: str, context: str) -> str:
+    return f"""
 You are Talking YouTube, a precise transcript-grounded assistant.
 
 Rules:
@@ -303,24 +341,23 @@ Question:
 """.strip()
 
 
-def _format_context(documents: list[Document]) -> str:
+def _format_context(matches: list[ChunkRecord]) -> str:
     blocks: list[str] = []
-    for index, doc in enumerate(documents, start=1):
-        video_id = doc.metadata.get("video_id", "unknown")
-        timestamp = doc.metadata.get("timestamp") or "00:00"
+    for index, match in enumerate(matches, start=1):
+        timestamp = match.timestamp or "00:00"
         blocks.append(
-            f"[source {index} | video {video_id} | {timestamp}]\n{doc.page_content}"
+            f"[source {index} | video {match.video_id} | {timestamp}]\n{match.content}"
         )
     return "\n\n".join(blocks)
 
 
-def _source_from_match(doc: Document, score: float) -> SourceChunk:
+def _source_from_match(match: ChunkRecord) -> SourceChunk:
     return SourceChunk(
-        video_id=str(doc.metadata.get("video_id", "")),
-        source_url=str(doc.metadata.get("source_url", "")),
-        timestamp=doc.metadata.get("timestamp"),
-        text=_compact(doc.page_content),
-        score=float(score),
+        video_id=match.video_id,
+        source_url=match.source_url or "",
+        timestamp=match.timestamp,
+        text=_compact(match.content),
+        score=match.score,
     )
 
 
@@ -354,4 +391,3 @@ def _timestamp_to_seconds(timestamp: str | None) -> float | None:
         return minutes * 60 + seconds
     hours, minutes, seconds = parts
     return hours * 3600 + minutes * 60 + seconds
-
